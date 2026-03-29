@@ -18,7 +18,7 @@ import {
 import { discoverOpenClawInstallations } from './openclaw-install-discovery'
 import { createManagedBackupArchive } from './openclaw-backup-index'
 import { ensureWritableOpenClawBackupRootDirectory } from './openclaw-backup-roots'
-import { buildMacNpmCommand } from './node-runtime'
+import { buildMacNpmCommand, buildWindowsNpmCommand } from './node-runtime'
 import { resolveOpenClawPathsFromStateRoot } from './openclaw-paths'
 import { resolveSafeWorkingDirectory } from './runtime-working-directory'
 import { withManagedOperationLock } from './managed-operation-lock'
@@ -36,6 +36,7 @@ import {
 } from './openclaw-npm-runtime'
 import {
   runMacOpenClawElevatedLifecycleTransaction,
+  runWindowsOpenClawElevatedLifecycleTransaction,
   type OpenClawElevatedLifecycleTransactionResult,
 } from './openclaw-elevated-lifecycle-transaction'
 
@@ -332,6 +333,8 @@ async function resolveNpmCommandForCandidate(candidate: OpenClawInstallCandidate
 }
 
 function requiresAdminElevation(candidate: OpenClawInstallCandidate): boolean {
+  const isWin = process.platform === 'win32'
+  if (isWin) return false // Assume Windows users can manage their own elevation for now or handle via UAC
   if (process.platform !== 'darwin') return false
   if (candidate.installSource !== 'npm-global') return false
   const userHome = homedir()
@@ -535,7 +538,7 @@ async function runUserManagedOwnershipRepairUpgrade(
   npmCommand: string,
   npmCommandOptions: OpenClawNpmCommandOptions
 ) {
-  if (process.platform !== 'darwin') {
+  if (process.platform !== 'darwin' && process.platform !== 'win32') {
     const ownershipTargets = collectOwnershipRepairDirectories(candidate)
     const recoveryCommands = [
       ownershipTargets.length > 0
@@ -561,18 +564,31 @@ async function runUserManagedOwnershipRepairUpgrade(
 
   const detectedBinDir = path.dirname(npmCommand)
   const safeWorkingDirectory = resolveSafeWorkingDirectory()
-  const command = buildMacUserManagedOwnershipRepairAndUpgradeCommand(candidate, targetVersion, {
-    npmCommandOptions,
-    detectedBinDir,
-    npmCacheDir: path.join(homedir(), '.npm'),
-    workingDirectory: safeWorkingDirectory,
-  })
+  const isWin = process.platform === 'win32'
 
-  const result = await runMacOpenClawElevatedLifecycleTransaction({
+  const builder = isWin ? buildWindowsNpmCommand : buildMacNpmCommand
+  const runElevatedTransaction = isWin
+    ? runWindowsOpenClawElevatedLifecycleTransaction
+    : runMacOpenClawElevatedLifecycleTransaction
+
+  const command = isWin
+    ? builder(buildOpenClawInstallArgs(targetVersion, undefined, npmCommandOptions), {
+        detectedBinDir,
+        workingDirectory: safeWorkingDirectory,
+      })
+    : buildMacUserManagedOwnershipRepairAndUpgradeCommand(candidate, targetVersion, {
+        npmCommandOptions,
+        detectedBinDir,
+        npmCacheDir: path.join(homedir(), '.npm'),
+        workingDirectory: safeWorkingDirectory,
+      })
+
+  const result = await runElevatedTransaction({
     operation: 'upgrade',
     lifecycleCommand: command,
-    prompt:
-      'Qclaw 检测到当前 OpenClaw 安装目录存在权限/所有权问题，无法直接升级。\n\nQclaw 将先修正该目录 ownership，再继续升级到目标版本。\n\n请输入你的 Mac 登录密码以继续。',
+    prompt: isWin
+      ? `Qclaw 检测到当前 OpenClaw 安装目录存在权限问题，无法直接升级。\n\nQclaw 将尝试通过管理员权限修复权限并升级到 ${targetVersion}。`
+      : 'Qclaw 检测到当前 OpenClaw 安装目录存在权限/所有权问题，无法直接升级。\n\nQclaw 将先修正该目录 ownership，再继续升级到目标版本。\n\n请输入你的 Mac 登录密码以继续。',
     timeoutMs: buildMirrorAwareTimeoutMs(MAIN_RUNTIME_POLICY.node.installOpenClawTimeoutMs),
     controlDomain: 'upgrade',
     binaryPath: candidate.resolvedBinaryPath || candidate.binaryPath,

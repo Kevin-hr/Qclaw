@@ -275,25 +275,54 @@ function buildDarwinRepairCommand(
   ].join('\n')
 }
 
-function buildRepairPrompt(): string {
+function buildWindowsRepairCommand(repairRoots: string[]): string {
+  const commands = repairRoots.map((repairRoot) => {
+    const quotedRoot = `"${repairRoot}"`
+    return `icacls ${quotedRoot} /grant "%USERNAME%:(OI)(CI)F" /T /C /Q >nul 2>&1 || set qclaw_repair_status=1`
+  })
+
   return [
+    'set qclaw_repair_status=0',
+    ...commands,
+    'exit %qclaw_repair_status%',
+  ].join(' && ')
+}
+
+function buildRepairPrompt(platform: NodeJS.Platform): string {
+  const promptParts = [
     'Qclaw 检测到 OpenClaw 配置或运行目录权限异常。',
     '',
     'Qclaw 需要先修复这些目录的 ownership 和可写权限，才能继续当前操作。',
     '',
-    '请输入你的 Mac 登录密码以继续。',
-  ].join('\n')
+  ]
+
+  if (platform === 'darwin') {
+    promptParts.push('请输入你的 Mac 登录密码以继续。')
+  } else if (platform === 'win32') {
+    promptParts.push('请在弹出的系统对话框中确认管理员权限以继续。')
+  }
+
+  return promptParts.join('\n')
 }
 
 function buildRepairFailureMessage(params: {
   blockedProbes: OpenClawInstallPathProbe[]
   repairRoots: string[]
   reason: string
+  platform: NodeJS.Platform
 }): string {
-  const repairCommand =
-    params.repairRoots.length > 0
-      ? `sudo chown -R "$(id -u)":"$(id -g)" ${params.repairRoots.map((item) => quotePosixShellArg(item)).join(' ')}`
-      : 'sudo chown -R "$(id -u)":"$(id -g)" ~/.openclaw ~/.npm'
+  let repairCommand = ''
+  if (params.platform === 'win32') {
+    repairCommand =
+      params.repairRoots.length > 0
+        ? `icacls ${params.repairRoots.map((item) => `"${item}"`).join(' ')} /grant "%USERNAME%:(OI)(CI)F" /T`
+        : 'icacls "%USERPROFILE%\\.openclaw" /grant "%USERNAME%:(OI)(CI)F" /T'
+  } else {
+    repairCommand =
+      params.repairRoots.length > 0
+        ? `sudo chown -R "$(id -u)":"$(id -g)" ${params.repairRoots.map((item) => quotePosixShellArg(item)).join(' ')}`
+        : 'sudo chown -R "$(id -u)":"$(id -g)" ~/.openclaw ~/.npm'
+  }
 
   return [
     '检测到 OpenClaw 相关目录权限异常。',
@@ -348,19 +377,7 @@ async function maybeAttemptPermissionRepair(
   const repairRoots = dedupePaths(
     blockedEntries.map(({ path }) => resolveRepairRootForPath(path, openClawPaths, resolvedDependencies))
   )
-  if (repairRoots.length === 0) {
-    return {
-      attempted: false,
-      repaired: false,
-      message: buildRepairFailureMessage({
-        blockedProbes: blockedEntries.map((entry) => entry.probe),
-        repairRoots,
-        reason: '当前故障路径不在 Qclaw 的安全自动修复范围内，请手动修复后重试。',
-      }),
-    }
-  }
-
-  if (resolvedDependencies.platform !== 'darwin') {
+  if (resolvedDependencies.platform !== 'darwin' && resolvedDependencies.platform !== 'win32') {
     return {
       attempted: false,
       repaired: false,
@@ -368,13 +385,19 @@ async function maybeAttemptPermissionRepair(
         blockedProbes: blockedEntries.map((entry) => entry.probe),
         repairRoots,
         reason: '当前平台暂未接入自动提权修复，请手动修复后重试。',
+        platform: resolvedDependencies.platform,
       }),
     }
   }
 
+  const repairCommand =
+    resolvedDependencies.platform === 'win32'
+      ? buildWindowsRepairCommand(repairRoots)
+      : buildDarwinRepairCommand(repairRoots, resolvedDependencies.currentUser)
+
   const repairResult = await resolvedDependencies.runPrivilegedRepair({
-    command: buildDarwinRepairCommand(repairRoots, resolvedDependencies.currentUser),
-    prompt: buildRepairPrompt(),
+    command: repairCommand,
+    prompt: buildRepairPrompt(resolvedDependencies.platform),
     controlDomain: context.controlDomain || 'global',
   })
 
@@ -386,6 +409,7 @@ async function maybeAttemptPermissionRepair(
         blockedProbes: blockedEntries.map((entry) => entry.probe),
         repairRoots,
         reason: repairResult.stderr || 'Qclaw 自动修复权限失败，请手动修复后重试。',
+        platform: resolvedDependencies.platform,
       }),
     }
   }
@@ -407,6 +431,7 @@ async function maybeAttemptPermissionRepair(
         blockedProbes: remainingBlocked.map((entry) => entry.probe),
         repairRoots,
         reason: 'Qclaw 已尝试自动修复，但仍有目录权限异常。',
+        platform: resolvedDependencies.platform,
       }),
     }
   }

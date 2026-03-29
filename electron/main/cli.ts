@@ -22,6 +22,7 @@ import {
   buildAppleScriptDoShellScript,
   buildGitHubHttpsRewriteEnvCommands,
   buildMacNpmCommand,
+  buildWindowsNpmCommand,
   extractNodeBinDir,
   isNodeVersionAtLeast,
   listNodeExecutableCandidates,
@@ -72,7 +73,6 @@ import {
   resolvePairingConfigTarget,
 } from './pairing-allowfrom-config'
 import { buildCliPathWithCandidates } from './runtime-path-discovery'
-import { inspectMacNodeInstaller, type NodeInstallerReadinessResult } from './node-installer-checks'
 import { isSkipConfigUnsupportedError, shouldTryLegacySkipConfig } from './plugin-install-npx'
 import {
   DEFAULT_BUNDLED_NODE_REQUIREMENT,
@@ -126,8 +126,14 @@ import {
 } from './openclaw-npm-runtime'
 import {
   runMacOpenClawElevatedLifecycleTransaction,
+  runWindowsOpenClawElevatedLifecycleTransaction,
   type OpenClawElevatedLifecycleTransactionResult,
 } from './openclaw-elevated-lifecycle-transaction'
+import {
+  inspectMacNodeInstaller,
+  inspectWindowsNodeInstaller,
+  type NodeInstallerReadinessResult,
+} from './node-installer-checks'
 import { sanitizeManagedInstallerEnv } from './managed-installer-env'
 import { cleanupIsolatedNpmCacheEnv, createIsolatedNpmCacheEnv } from './npm-cache-env'
 import { pollWithBackoff } from '../../src/shared/polling'
@@ -343,13 +349,25 @@ function createPermissionAutoRepairDependencies() {
       prompt: string
       controlDomain: string
     }) => {
-      if (process.platform !== 'darwin') {
+      const isWin = process.platform === 'win32'
+      if (!isWin && process.platform !== 'darwin') {
         return {
           ok: false,
           stdout: '',
           stderr: '当前平台暂未接入自动提权修复。',
           code: 1,
         }
+      }
+
+      if (isWin) {
+        return runWindowsOpenClawElevatedLifecycleTransaction({
+          operation: 'upgrade', // 为复用逻辑，暂统一使用 upgrade 类型的 snapshot 逻辑
+          lifecycleCommand: request.command,
+          prompt: request.prompt,
+          timeoutMs: MAIN_RUNTIME_POLICY.cli.defaultDirectTimeoutMs,
+          controlDomain: request.controlDomain,
+          runDirect: runDirectOnce,
+        })
       }
 
       const capabilityError = await guardPlatformCommands(['osascript'])
@@ -1456,7 +1474,7 @@ async function resolveNodeFromInstalledNvmVersions(
   return null
 }
 
-function buildMacOpenClawInstallFallbackCommand(options: {
+export function buildMacOpenClawInstallFallbackCommand(options: {
   version: string
   npmCommandOptions: OpenClawNpmCommandOptions
   detectedBinDir?: string | null
@@ -1480,6 +1498,24 @@ function buildMacOpenClawInstallFallbackCommand(options: {
   return commands.map((command) => `(${command})`).join(' || ')
 }
 
+export function buildWindowsOpenClawInstallFallbackCommand(options: {
+  version: string
+  npmCommandOptions: OpenClawNpmCommandOptions
+  detectedBinDir?: string | null
+  workingDirectory?: string | null
+}): string {
+  const commands = OPENCLAW_NPM_REGISTRY_MIRRORS.map((mirror) =>
+    buildWindowsNpmCommand(
+      buildOpenClawInstallArgs(options.version, mirror.registryUrl, options.npmCommandOptions),
+      {
+        detectedBinDir: options.detectedBinDir,
+        workingDirectory: options.workingDirectory,
+      }
+    )
+  )
+  return commands.join(' || ')
+}
+
 async function installOpenClawWithNpmMirrorFallback(
   version: string,
   runner: (args: string[]) => Promise<CliResult>,
@@ -1499,7 +1535,9 @@ async function installOpenClawWithNpmMirrorFallback(
 }
 
 function shouldRetryOpenClawInstallWithAdmin(result: CliResult): boolean {
-  if (result.ok || process.platform !== 'darwin') return false
+  if (result.ok) return false
+  const isWin = process.platform === 'win32'
+  if (!isWin && process.platform !== 'darwin') return false
   const output = `${String(result.stderr || '')}\n${String(result.stdout || '')}`
   return isOpenClawInstallPermissionFailureOutput(output)
 }

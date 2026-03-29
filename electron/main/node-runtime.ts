@@ -53,6 +53,16 @@ export function prefixPosixCommandWithWorkingDirectory(
   return `cd ${quotePosixShellArg(normalizedWorkingDirectory)} && ${command}`
 }
 
+export function prefixWindowsCommandWithWorkingDirectory(
+  command: string,
+  workingDirectory?: string | null
+): string {
+  const normalizedWorkingDirectory = String(workingDirectory || '').trim()
+  if (!normalizedWorkingDirectory) return command
+  // Use /d to handle drive changes in cmd.exe
+  return `cd /d "${normalizedWorkingDirectory}" && ${command}`
+}
+
 function parseSemver(version: string): ParsedSemver | null {
   const matched = String(version || '').trim().match(/^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?/)
   if (!matched) return null
@@ -203,6 +213,30 @@ export function buildMacNpmCommand(
   }
 
   return prefixPosixCommandWithWorkingDirectory(commands.join(' && '), options.workingDirectory)
+}
+
+export function buildWindowsNpmCommand(
+  npmArgs: string[],
+  options: {
+    detectedBinDir?: string | null
+    workingDirectory?: string | null
+  } = {}
+): string {
+  const searchPath = buildNodePathWithCandidates(
+    'win32',
+    process.env.PATH || '',
+    options.detectedBinDir ?? null,
+    process.env.APPDATA || ''
+  )
+  // On Windows, we need to be careful with quoting in cmd strings.
+  // Using simplified quoting for args that don't have spaces, but surrounding the whole path in quotes.
+  const npmCommand = `npm ${npmArgs.join(' ')}`
+  const commands = [
+    `set "PATH=${searchPath}"`,
+    npmCommand,
+  ]
+
+  return prefixWindowsCommandWithWorkingDirectory(commands.join(' && '), options.workingDirectory)
 }
 
 export function isNodeVersionAtLeast(currentVersion: string, requiredVersion: string): boolean {

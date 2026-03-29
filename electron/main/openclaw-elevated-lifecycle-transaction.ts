@@ -7,8 +7,8 @@ const fs = process.getBuiltinModule('node:fs') as typeof import('node:fs')
 const path = process.getBuiltinModule('node:path') as typeof import('node:path')
 const os = process.getBuiltinModule('node:os') as typeof import('node:os')
 
-const { access, lstat, realpath, stat } = fs.promises
-const { homedir, userInfo } = os
+const { access, lstat, realpath, readFile, stat, unlink } = fs.promises
+const { homedir, tmpdir, userInfo } = os
 const { join, relative, isAbsolute } = path
 
 const LIFECYCLE_STATUS_MARKER = '__QCLAW_TXN_LIFECYCLE_STATUS__='
@@ -312,6 +312,26 @@ function buildRepairCommands(
   })
 }
 
+function buildWindowsRepairCommands(
+  snapshot: OpenClawRepairSnapshot
+): string[] {
+  // Use icacls for Windows permission repair
+  // /grant :F gives full control. (OI)(CI) means object inherit and container inherit.
+  // We use %USERNAME% to refer to the current user in a cmd context.
+  return snapshot.targets.flatMap((target) => {
+    const quotedPath = `"${target.path}"`
+    const recursiveRepairPath = normalizePathValue(target.realPath || target.path)
+    const quotedRecursiveRepairPath = `"${recursiveRepairPath}"`
+    const commands: string[] = []
+    if (target.createIfMissing) {
+      commands.push(`if not exist ${quotedPath} mkdir ${quotedPath} >nul 2>&1 || set qclaw_repair_status=1`)
+    }
+    // Grant full control to the current user
+    commands.push(`icacls ${quotedRecursiveRepairPath} /grant "%USERNAME%:(OI)(CI)F" /T /C /Q >nul 2>&1 || set qclaw_repair_status=1`)
+    return commands
+  })
+}
+
 export async function buildOpenClawRepairSnapshot(options: {
   operation: OpenClawElevatedLifecycleOperation
   binaryPath?: string | null
@@ -444,6 +464,27 @@ export function buildMacOpenClawElevatedLifecycleTransactionCommand(options: {
   ]
 
   return commands.join('\n')
+}
+
+export function buildWindowsOpenClawElevatedLifecycleTransactionCommand(options: {
+  lifecycleCommand: string
+  snapshot: OpenClawRepairSnapshot
+}): string {
+  // Use cmd syntax for Windows
+  const commands = [
+    'set qclaw_lifecycle_status=0',
+    'set qclaw_repair_status=0',
+    `cmd /c "${options.lifecycleCommand}"`,
+    'set qclaw_lifecycle_status=%ERRORLEVEL%',
+    ...buildWindowsRepairCommands(options.snapshot),
+    `echo ${LIFECYCLE_STATUS_MARKER}%qclaw_lifecycle_status%`,
+    `echo ${REPAIR_STATUS_MARKER}%qclaw_repair_status%`,
+    'if %qclaw_lifecycle_status% neq 0 exit 1',
+    'if %qclaw_repair_status% neq 0 exit 1',
+    'exit 0',
+  ]
+
+  return commands.join(' && ')
 }
 
 export async function runMacOpenClawElevatedLifecycleTransaction(options: {
@@ -581,6 +622,164 @@ export async function runMacOpenClawElevatedLifecycleTransaction(options: {
         .map((failure) => `${failure.role}: ${failure.path} -> ${failure.detail}`)
         .join('\n')
     )
+  }
+
+  return {
+    ok: status === 'success',
+    stdout: parsed.stdout,
+    stderr: [parsed.stderr, ...extraMessages].filter(Boolean).join('\n\n'),
+    code: elevatedResult.code,
+    canceled: elevatedResult.canceled,
+    status,
+    snapshot,
+    lifecycle: {
+      ok: lifecycleOk,
+      code: parsed.lifecycleStatus,
+    },
+    repair: {
+      ok: repairOk,
+      code: parsed.repairStatus,
+    },
+    verification: {
+      ok: verificationOk,
+      failures: verificationFailures,
+    },
+  }
+}
+
+export async function runWindowsOpenClawElevatedLifecycleTransaction(options: {
+  operation: OpenClawElevatedLifecycleOperation
+  lifecycleCommand: string
+  prompt: string
+  timeoutMs: number
+  controlDomain: string
+  binaryPath?: string | null
+  preferredStateRootPath?: string | null
+  homeDir?: string | null
+  userDataDir?: string | null
+  qclawSafeWorkDir?: string | null
+  includeManagedInstallerRoot?: boolean
+  includeUserDataNpmCache?: boolean
+  snapshotResolver?: () => Promise<OpenClawRepairSnapshot>
+  runDirect: (
+    command: string,
+    args: string[],
+    timeout: number,
+    controlDomain: string
+  ) => Promise<OpenClawCommandResultLike>
+  verifyTargetAccess?: (target: OpenClawRepairTarget) => Promise<VerifyRepairTargetResult>
+}): Promise<OpenClawElevatedLifecycleTransactionResult> {
+  let snapshot: OpenClawRepairSnapshot | null = null
+
+  try {
+    snapshot = await (
+      options.snapshotResolver ||
+      (() =>
+        buildOpenClawRepairSnapshot({
+          operation: options.operation,
+          binaryPath: options.binaryPath,
+          preferredStateRootPath: options.preferredStateRootPath,
+          homeDir: options.homeDir,
+          userDataDir: options.userDataDir,
+          qclawSafeWorkDir: options.qclawSafeWorkDir,
+          includeManagedInstallerRoot: options.includeManagedInstallerRoot,
+          includeUserDataNpmCache: options.includeUserDataNpmCache,
+        }))
+    )()
+  } catch (error) {
+    return {
+      ok: false,
+      stdout: '',
+      stderr: error instanceof Error ? error.message : String(error || 'repair snapshot failed'),
+      code: 1,
+      status: 'snapshot_failed',
+      snapshot: null,
+      lifecycle: {
+        ok: false,
+        code: null,
+      },
+      repair: {
+        ok: false,
+        code: null,
+      },
+      verification: {
+        ok: false,
+        failures: [],
+      },
+    }
+  }
+
+  const tempFile = join(tmpdir(), `qclaw-txn-${Date.now()}.log`)
+  const lifecycleCommand = buildWindowsOpenClawElevatedLifecycleTransactionCommand({
+    lifecycleCommand: options.lifecycleCommand,
+    snapshot,
+  })
+
+  // On Windows, we use powershell to run a command as admin.
+  // We use -Wait to wait for completion.
+  // To capture stdout/stderr from Start-Process -Verb RunAs, we redirect it to a temp file.
+  const winCommand = `cmd /c ${lifecycleCommand.replace(/"/g, '\"')} > "${tempFile}" 2>&1`
+  const elevatedResult = await options.runDirect(
+    'powershell',
+    ['-Command', `Start-Process cmd -ArgumentList "/c ${winCommand.replace(/"/g, '`\"')}" -Verb RunAs -Wait`],
+    options.timeoutMs,
+    options.controlDomain
+  )
+
+  const combinedOutput = await readFile(tempFile, 'utf8').catch(() => '')
+  await unlink(tempFile).catch(() => {})
+
+  const elevatedResultWithOutput = {
+    ...elevatedResult,
+    stdout: combinedOutput,
+    stderr: '',
+  }
+
+  const parsed = parseTransactionStatuses(elevatedResultWithOutput)
+  const lifecycleOk = parsed.lifecycleStatus === 0
+  const repairOk = parsed.repairStatus === 0
+
+  const verifyTargetAccess =
+    options.verifyTargetAccess ||
+    ((target: OpenClawRepairTarget) => defaultVerifyRepairTargetAccess(target, null)) // pass null for userId on Windows for now
+
+  const verificationChecks = await Promise.all(
+    snapshot.targets.map(async (target) => ({
+      target,
+      result: await verifyTargetAccess(target),
+    }))
+  )
+
+  const verificationFailures = verificationChecks
+    .filter((entry) => !entry.result.ok)
+    .map((entry) => ({
+      role: entry.target.role,
+      path: entry.target.path,
+      detail: entry.result.detail || 'verification failed',
+    }))
+
+  const verificationOk = verificationFailures.length === 0
+
+  let status: OpenClawElevatedLifecycleTransactionStatus = 'success'
+  if (!lifecycleOk && repairOk && verificationOk) {
+    status = 'lifecycle_failed_environment_repaired'
+  } else if (!lifecycleOk) {
+    status = 'lifecycle_failed_environment_not_clean'
+  } else if (!repairOk) {
+    status = 'post_repair_failed_after_lifecycle'
+  } else if (!verificationOk) {
+    status = 'post_repair_verification_failed'
+  }
+
+  const extraMessages: string[] = []
+  if (status === 'lifecycle_failed_environment_repaired') {
+    extraMessages.push('管理员命令执行失败，但提权后的环境修复与校验已完成。')
+  } else if (status === 'lifecycle_failed_environment_not_clean') {
+    extraMessages.push('管理员命令执行失败，且提权后的环境未完全恢复到健康状态。')
+  } else if (status === 'post_repair_failed_after_lifecycle') {
+    extraMessages.push('管理员命令执行完成，但提权后的环境修复失败。')
+  } else if (status === 'post_repair_verification_failed') {
+    extraMessages.push('管理员命令执行完成，但提权后的环境校验仍未通过。')
   }
 
   return {

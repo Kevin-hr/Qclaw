@@ -19,7 +19,7 @@ interface CliLikeResult {
   code: number | null
 }
 
-interface InspectMacNodeInstallerOptions {
+interface InspectNodeInstallerOptions {
   fileExists?: (path: string) => Promise<boolean>
   fileSize?: (path: string) => Promise<number>
   runDirect?: (command: string, args: string[], timeout?: number) => Promise<CliLikeResult>
@@ -36,7 +36,7 @@ export type { NodeInstallerIssue, NodeInstallerReadinessResult }
 
 export async function inspectMacNodeInstaller(
   installerPath: string,
-  options: InspectMacNodeInstallerOptions = {}
+  options: InspectNodeInstallerOptions = {}
 ): Promise<NodeInstallerReadinessResult> {
   const fsPromises = process.getBuiltinModule('node:fs/promises') as typeof import('node:fs/promises')
   const fileExists =
@@ -146,5 +146,51 @@ export async function inspectMacNodeInstaller(
     }
   }
 
+  return { ok: true }
+}
+
+export async function inspectWindowsNodeInstaller(
+  installerPath: string,
+  options: InspectNodeInstallerOptions = {}
+): Promise<NodeInstallerReadinessResult> {
+  const fsPromises = process.getBuiltinModule('node:fs/promises') as typeof import('node:fs/promises')
+  const fileExists =
+    options.fileExists ||
+    (async (targetPath: string) => {
+      try {
+        await fsPromises.access(targetPath)
+        return true
+      } catch {
+        return false
+      }
+    })
+  const getFileSize =
+    options.fileSize ||
+    (async (targetPath: string) => {
+      const fileStat = await fsPromises.stat(targetPath)
+      return fileStat.size
+    })
+
+  if (!(await fileExists(installerPath))) {
+    return { ok: false, issue: createNodeInstallerIssue('missing-installer', installerPath) }
+  }
+
+  try {
+    const size = await getFileSize(installerPath)
+    if (size <= 0) {
+      return { ok: false, issue: createNodeInstallerIssue('corrupted-installer', 'Downloaded installer file is empty') }
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      issue: createNodeInstallerIssue(
+        'corrupted-installer',
+        error instanceof Error ? error.message : String(error)
+      ),
+    }
+  }
+
+  // Windows-specific checks: we could check digital signature with powershell Get-AuthenticodeSignature
+  // but for now, we'll keep it simple and assume basic file integrity.
   return { ok: true }
 }
